@@ -1,0 +1,779 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import uuid
+import redis
+import speech_recognition as sr
+from gtts import gTTS
+from googletrans import Translator
+import requests
+import json
+import os
+from datetime import datetime
+import base64
+import pandas as pd
+from rapidfuzz import process, fuzz
+import numpy as np
+from languages import SUPPORTED_LANGUAGES, get_language_code, is_supported_language, LANGUAGE_CODES
+
+# ----------------- Load environment variables -----------------
+load_dotenv()
+
+# ----------------- FastAPI app -----------------
+app = FastAPI()
+translator = Translator()
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------- Config -----------------
+CENSUS_API_URL = "https://api.data.gov.in/resource/1d369aae-155a-4cc8-b7a8-04d4cd5a4a96"
+API_KEY = os.getenv("DATA_GOV_IN_API_KEY", "YOUR_API_KEY_HERE")
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+HISTORY_FILE = "session_history.json"
+API_CACHE = {}
+SESSIONS_FILE = "sessions.json"
+
+# ----------------- Redis -----------------
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+try:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+except Exception as e:
+    print(f"Warning: Redis not available at {REDIS_URL}: {e}")
+    redis_client = None
+
+# ----------------- Load local Excel dataset -----------------
+try:
+    CENSUS_DF = pd.read_excel("census_data.xls")
+except FileNotFoundError:
+    raise FileNotFoundError("Excel file 'census_data.xls' not found in backend directory.")
+
+# Precompute states and fields
+STATES = list(CENSUS_DF['State'].unique())
+FIELDS = [col for col in CENSUS_DF.columns if col.lower() != 'state']
+
+# Field synonyms mapping - common query terms to actual column names
+# Order matters: more specific (longer) terms should come first
+FIELD_SYNONYMS = {
+    # === Total Population (Most Common) ===
+    'male population': 'Total Population Male',
+    'female population': 'Total Population Female',
+    'total population': 'Total Population Person',
+    'population person': 'Total Population Person',
+    'males': 'Total Population Male',
+    'male': 'Total Population Male',
+    'females': 'Total Population Female',
+    'female': 'Total Population Female',
+    'population': 'Total Population Person',
+    
+    # === Households ===
+    'households': 'No of Households',
+    'household': 'No of Households',
+    'number of households': 'No of Households',
+    
+    # === Age Group 0-6 ===
+    'population age group 0-6': 'Population in the age group 0-6 Person',
+    'children population 0-6': 'Population in the age group 0-6 Person',
+    'children 0-6': 'Population in the age group 0-6 Person',
+    'male children 0-6': 'Population in the age group 0-6 Male',
+    'female children 0-6': 'Population in the age group 0-6 Female',
+    'age group 0-6 person': 'Population in the age group 0-6 Person',
+    'age group 0-6 male': 'Population in the age group 0-6 Male',
+    'age group 0-6 female': 'Population in the age group 0-6 Female',
+    
+    # === Scheduled Castes ===
+    'scheduled castes population': 'Scheduled Castes population Person',
+    'sc population': 'Scheduled Castes population Person',
+    'scheduled castes': 'Scheduled Castes population Person',
+    'scheduled castes male': 'Scheduled Castes population Male',
+    'scheduled castes female': 'Scheduled Castes populationFemale',
+    'sc male': 'Scheduled Castes population Male',
+    'sc female': 'Scheduled Castes populationFemale',
+    
+    # === Scheduled Tribes ===
+    'scheduled tribes population': 'Scheduled Tribes population Person',
+    'st population': 'Scheduled Tribes population Person',
+    'scheduled tribes': 'Scheduled Tribes population Person',
+    'scheduled tribes male': 'Scheduled Tribes population Male',
+    'scheduled tribes female': 'Scheduled Tribes population Female',
+    'st male': 'Scheduled Tribes population Male',
+    'st female': 'Scheduled Tribes population Female',
+    
+    # === Literates ===
+    'literates population': 'Literates Population Person',
+    'literates': 'Literates Population Person',
+    'literacy': 'Literates Population Person',
+    'literate population': 'Literates Population Person',
+    'male literates': 'Literates Population Male',
+    'female literates': 'Literates Population Female',
+    'literate males': 'Literates Population Male',
+    'literate females': 'Literates Population Female',
+    
+    # === Illiterates ===
+    'illiterates': 'Illiterate Persons',
+    'illiterate population': 'Illiterate Persons',
+    'illiteracy': 'Illiterate Persons',
+    'illiterate persons': 'Illiterate Persons',
+    'male illiterates': 'Illiterate Male',
+    'female illiterates': 'Illiterate Female',
+    'illiterate male': 'Illiterate Male',
+    'illiterate female': 'Illiterate Female',
+    
+    # === Total Workers ===
+    'total worker population': 'Total Worker Population Person',
+    'working population': 'Total Worker Population Person',
+    'workers': 'Total Worker Population Person',
+    'worker': 'Total Worker Population Person',
+    'total workers': 'Total Worker Population Person',
+    'male workers': 'Total Worker Population Male',
+    'female workers': 'Total Worker Population Female',
+    'male worker population': 'Total Worker Population Male',
+    'female worker population': 'Total Worker Population Female',
+    
+    # === Main Workers ===
+    'main workers': 'Main Working Population Person',
+    'main working population': 'Main Working Population Person',
+    'main worker population': 'Main Working Population Person',
+    'main worker': 'Main Working Population Person',
+    'main male workers': 'Main Working Population Male',
+    'main female workers': 'Main Working Population Female',
+    
+    # === Main Cultivators ===
+    'main cultivators': 'Main Cultivator Population Person',
+    'cultivators': 'Main Cultivator Population Person',
+    'main cultivator population': 'Main Cultivator Population Person',
+    'male cultivators': 'Main Cultivator Population Male',
+    'female cultivators': 'Main Cultivator Population Female',
+    'main cultivator male': 'Main Cultivator Population Male',
+    'main cultivator female': 'Main Cultivator Population Female',
+    
+    # === Main Agricultural Labourers ===
+    'main agricultural labourers': 'Main Agricultural Labourers Population Person',
+    'agricultural labourers': 'Main Agricultural Labourers Population Person',
+    'agricultural laborers': 'Main Agricultural Labourers Population Person',
+    'farm labourers': 'Main Agricultural Labourers Population Person',
+    'main agricultural labourer population': 'Main Agricultural Labourers Population Person',
+    'male agricultural labourers': 'Main Agricultural Labourers Population Male',
+    'female agricultural labourers': 'Main Agricultural Labourers Population Female',
+    
+    # === Main Household Industries ===
+    'main household industries': 'Main Household Industries Population Person',
+    'household industries': 'Main Household Industries Population Person',
+    'household industry workers': 'Main Household Industries Population Person',
+    'main household industry population': 'Main Household Industries Population Person',
+    'male household industries': 'Main Household Industries Population Male',
+    'female household industries': 'Main Household Industries Population Female',
+    
+    # === Main Other Workers ===
+    'main other workers': 'Main Other Workers Population Person',
+    'other workers': 'Main Other Workers Population Person',
+    'main other worker population': 'Main Other Workers Population Person',
+    'male other workers': 'Main Other Workers Population Male',
+    'female other workers': 'Main Other Workers Population Female',
+    
+    # === Marginal Workers ===
+    'marginal workers': 'Marginal Worker Population Person',
+    'marginal worker population': 'Marginal Worker Population Person',
+    'marginal working population': 'Marginal Worker Population Person',
+    'male marginal workers': 'Marginal Worker Population Male',
+    'female marginal workers': 'Marginal Worker Population Female',
+    
+    # === Marginal Cultivators ===
+    'marginal cultivators': 'Marginal Cultivator Population Person',
+    'marginal cultivator population': 'Marginal Cultivator Population Person',
+    'male marginal cultivators': 'Marginal Cultivator Population Male',
+    'female marginal cultivators': 'Marginal Cultivator Population Female',
+    
+    # === Marginal Agricultural Labourers ===
+    'marginal agricultural labourers': 'Marginal Agriculture Labourers Population Person',
+    'marginal agricultural laborers': 'Marginal Agriculture Labourers Population Person',
+    'marginal farm labourers': 'Marginal Agriculture Labourers Population Person',
+    'male marginal agricultural labourers': 'Marginal Agriculture Labourers Population Male',
+    'female marginal agricultural labourers': 'Marginal Agriculture Labourers Population Female',
+    
+    # === Marginal Household Industries ===
+    'marginal household industries': 'Marginal Household Industries Population Person',
+    'marginal household industry workers': 'Marginal Household Industries Population Person',
+    'male marginal household industries': 'Marginal Household Industries Population Male',
+    'female marginal household industries': 'Marginal Household Industries Population Female',
+    
+    # === Marginal Other Workers ===
+    'marginal other workers': 'Marginal Other Workers Population Person',
+    'marginal other worker population': 'Marginal Other Workers Population Person',
+    'male marginal other workers': 'Marginal Other Workers Population Male',
+    'female marginal other workers': 'Marginal Other Workers Population Female',
+    
+    # === Non Working Population ===
+    'non working population': 'Non Working Population Person',
+    'non workers': 'Non Working Population Person',
+    'unemployed': 'Non Working Population Person',
+    'non working': 'Non Working Population Person',
+    'male non workers': 'Non Working Population Male',
+    'female non workers': 'Non Working Population Female',
+    'non working male': 'Non Working Population Male',
+    'non working female': 'Non Working Population Female',
+}
+
+# ----------------- Pydantic models -----------------
+class ChatRequest(BaseModel):
+    message: str
+    language: str
+    session_id: str
+
+class VoiceRequest(BaseModel):
+    audio_data: str
+    language: str
+
+class TTSRequest(BaseModel):
+    text: str
+    language: str
+
+class LoginRequest(BaseModel):
+    user_id: str
+
+# ----------------- History helpers -----------------
+def load_history(session_id):
+    try:
+        with open(HISTORY_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get(session_id, [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_history(session_id, history):
+    try:
+        with open(HISTORY_FILE, 'r') as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data[session_id] = history
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+# ----------------- Sessions helpers -----------------
+def load_sessions():
+    try:
+        with open(SESSIONS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_sessions(sessions):
+    with open(SESSIONS_FILE, 'w') as f:
+        json.dump(sessions, f, indent=2)
+
+# ----------------- NLP / Fuzzy Matching -----------------
+def get_best_state_match(query: str):
+    """
+    Extract state name from query using fuzzy matching.
+    Makes case-insensitive comparisons and handles partial matches.
+    """
+    query_lower = query.lower()
+    
+    # Create a mapping of lowercase state names to original state names
+    state_mapping = {state.lower(): state for state in STATES}
+    
+    # First, try exact match (case-insensitive)
+    if query_lower in state_mapping:
+        return state_mapping[query_lower]
+    
+    # Try to find state name in the query using fuzzy matching
+    # Check if any state name appears in the query
+    for state_lower, original_state in state_mapping.items():
+        if state_lower in query_lower or query_lower in state_lower:
+            return original_state
+    
+    # Use fuzzy matching on the entire query
+    match, score, _ = process.extractOne(query_lower, state_mapping.keys(), scorer=fuzz.partial_ratio)
+    if score > 60:
+        return state_mapping[match]
+    
+    # Also try matching individual words in the query
+    query_words = query_lower.split()
+    for word in query_words:
+        if len(word) > 3:  # Only check words longer than 3 characters
+            match, score, _ = process.extractOne(word, state_mapping.keys(), scorer=fuzz.ratio)
+            if score > 70:
+                return state_mapping[match]
+    
+    return None
+
+def get_best_field_match(query: str):
+    """
+    Extract field name from query using synonyms and fuzzy matching.
+    Checks more specific (longer) synonyms first to avoid false matches.
+    """
+    query_lower = query.lower()
+    
+    # Sort synonyms by length (longest first) to check specific terms before general ones
+    # This ensures "male population" matches before "population"
+    sorted_synonyms = sorted(FIELD_SYNONYMS.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    # First check synonyms - look for exact phrase matches first
+    # Check longer (more specific) synonyms first to avoid false matches
+    for synonym, actual_field in sorted_synonyms:
+        synonym_lower = synonym.lower()
+        synonym_words = synonym_lower.split()
+        query_words = query_lower.split()
+        
+        # For multi-word synonyms, check if all words appear consecutively
+        if len(synonym_words) > 1:
+            for i in range(len(query_words) - len(synonym_words) + 1):
+                if query_words[i:i+len(synonym_words)] == synonym_words:
+                    return actual_field
+        else:
+            # Single word synonym - check if it appears as a whole word
+            # Check if it appears with word boundaries (not as part of another word)
+            if synonym_lower in query_words:
+                return actual_field
+    
+    # Also check for gender-specific queries with common patterns
+    query_words = query_lower.split()
+    if 'male' in query_words:
+        # Look for male-specific fields
+        if any(word in query_lower for word in ['population', 'pop']):
+            return 'Total Population Male'
+        elif any(word in query_lower for word in ['literate', 'literacy']):
+            return 'Literates Population Male'
+        elif any(word in query_lower for word in ['illiterate', 'illiteracy']):
+            return 'Illiterate Male'
+        elif any(word in query_lower for word in ['worker', 'working']):
+            return 'Total Worker Population Male'
+    
+    if 'female' in query_words:
+        # Look for female-specific fields
+        if any(word in query_lower for word in ['population', 'pop']):
+            return 'Total Population Female'
+        elif any(word in query_lower for word in ['literate', 'literacy']):
+            return 'Literates Population Female'
+        elif any(word in query_lower for word in ['illiterate', 'illiteracy']):
+            return 'Illiterate Female'
+        elif any(word in query_lower for word in ['worker', 'working']):
+            return 'Total Worker Population Female'
+    
+    # Create a mapping of lowercase field names to original field names
+    field_mapping = {col.lower(): col for col in FIELDS}
+    
+    # Try exact match (case-insensitive) - if user asks for exact column name
+    if query_lower in field_mapping:
+        return field_mapping[query_lower]
+    
+    # Check if any field name appears in the query (for direct column queries)
+    for field_lower, original_field in field_mapping.items():
+        # Check if the entire field name appears in the query
+        if field_lower in query_lower:
+            # Make sure it's not a partial match
+            # Check if it appears as a complete phrase
+            field_words = field_lower.split()
+            query_words = query_lower.split()
+            
+            # If all words of the field name appear consecutively in the query
+            for i in range(len(query_words) - len(field_words) + 1):
+                if query_words[i:i+len(field_words)] == field_words:
+                    return original_field
+    
+    # Check if key words from field names appear in query (for more flexible matching)
+    query_words_set = set(query_lower.split())
+    best_word_match = None
+    best_word_score = 0
+    
+    # Common words that don't help with matching
+    common_words = {'population', 'person', 'male', 'female', 'in', 'the', 'of', 'and', 'or', 'is', 'what', 'how', 'many', 'number'}
+    
+    for field_lower, original_field in field_mapping.items():
+        field_words = set(field_lower.split())
+        # Remove common words that don't help with matching
+        field_words_filtered = field_words - common_words
+        query_words_filtered = query_words_set - common_words
+        
+        # Calculate overlap
+        common_words_count = len(field_words_filtered.intersection(query_words_filtered))
+        if common_words_count > 0:
+            # Score based on how many words match relative to field name length
+            score = common_words_count / max(len(field_words_filtered), 1)
+            if score > best_word_score and score > 0.3:  # At least 30% word overlap
+                best_word_score = score
+                best_word_match = original_field
+    
+    if best_word_match:
+        return best_word_match
+    
+    # Use fuzzy matching on the entire query
+    match, score, _ = process.extractOne(query_lower, field_mapping.keys(), scorer=fuzz.partial_ratio)
+    if score > 50:
+        return field_mapping[match]
+    
+    # Try matching individual significant words in the query
+    query_words = query_lower.split()
+    best_match = None
+    best_score = 0
+    for word in query_words:
+        if len(word) > 3:  # Only check words longer than 3 characters
+            match, score, _ = process.extractOne(word, field_mapping.keys(), scorer=fuzz.partial_ratio)
+            if score > best_score and score > 60:
+                best_score = score
+                best_match = field_mapping[match]
+    
+    return best_match
+
+def parse_query_for_filters(query: str):
+    """
+    Parse query to extract state and field information.
+    Returns a dictionary with 'state' and 'field' keys.
+    
+    This function processes natural language queries like:
+    - "what is the population of bihar" -> {state: "BIHAR", field: "Total Population Person"}
+    - "population of maharashtra" -> {state: "MAHARASHTRA", field: "Total Population Person"}
+    """
+    state = get_best_state_match(query)
+    field = get_best_field_match(query)
+    
+    # Log for debugging (can be removed in production)
+    if not state or not field:
+        print(f"Query parsing - State: {state}, Field: {field}, Query: {query}")
+    
+    return {"state": state, "field": field}
+
+# ----------------- Local data first -----------------
+def get_census_data(state, field):
+    """
+    Retrieve census data from the local dataset.
+    For state-level queries, returns the 'Total' row (aggregated data).
+    If 'Total' doesn't exist, aggregates Rural + Urban data.
+    """
+    if state and field:
+        # Filter rows for the specified state (case-insensitive)
+        state_rows = CENSUS_DF[CENSUS_DF['State'].str.lower() == state.lower()]
+        
+        if state_rows.empty:
+            return {"error": f"No data found for state '{state}'."}
+        
+        # Check if 'TRU' column exists (Rural/Urban/Total breakdown)
+        if 'TRU' in CENSUS_DF.columns:
+            # First try to get the 'Total' row (aggregated data)
+            total_row = state_rows[state_rows['TRU'] == 'Total']
+            
+            if not total_row.empty:
+                row = total_row.iloc[0]
+            else:
+                # If no 'Total' row, aggregate Rural + Urban
+                rural_row = state_rows[state_rows['TRU'] == 'Rural']
+                urban_row = state_rows[state_rows['TRU'] == 'Urban']
+                
+                if not rural_row.empty and not urban_row.empty:
+                    rural_value = rural_row.iloc[0][field]
+                    urban_value = urban_row.iloc[0][field]
+                    
+                    # Handle NaN values
+                    if pd.isna(rural_value):
+                        rural_value = 0
+                    if pd.isna(urban_value):
+                        urban_value = 0
+                    
+                    # Sum the values
+                    value = rural_value + urban_value
+                    # Use the first row as template, but update the value
+                    row = state_rows.iloc[0].copy()
+                    row[field] = value
+                else:
+                    # Fallback to first row if no Total/Rural/Urban breakdown
+                    row = state_rows.iloc[0]
+        else:
+            # If no TRU column, just take the first row
+            row = state_rows.iloc[0]
+        
+        # Extract the value for the requested field
+        if field not in row.index:
+            return {"error": f"Field '{field}' not found in dataset."}
+        
+        value = row[field]
+        
+        # Handle different data types
+        if isinstance(value, (pd._libs.missing.NAType, type(None))):
+            value = None
+        elif pd.isna(value):
+            value = None
+        elif isinstance(value, (pd.Timestamp, pd.Timedelta)):
+            value = str(value)
+        elif isinstance(value, (pd.Series, np.generic)):
+            value = value.item()  # convert numpy types to python native
+        else:
+            value = int(value) if isinstance(value, (np.integer, np.int64)) else value
+        
+        return {"state": state, "attribute": field, "value": value}
+    
+    elif field:  # Aggregate for India (no state specified)
+        if field in CENSUS_DF:
+            # Get India-level data (if exists) or sum all states
+            india_rows = CENSUS_DF[CENSUS_DF['State'].str.upper() == 'INDIA']
+            if not india_rows.empty and 'TRU' in CENSUS_DF.columns:
+                total_row = india_rows[india_rows['TRU'] == 'Total']
+                if not total_row.empty:
+                    total = total_row.iloc[0][field]
+                else:
+                    total = india_rows[field].sum()
+            else:
+                total = CENSUS_DF[field].sum()
+            
+            # Handle NaN and type conversion
+            if pd.isna(total):
+                total = "N/A"
+            else:
+                total = int(total) if isinstance(total, (np.integer, np.int64)) else total
+        else:
+            total = "N/A"
+        return {"state": "India", "attribute": field, "value": total}
+    else:
+        return {"error": "Sorry, unable to understand your request. Please specify both state and field."}
+
+
+# ----------------- Fallback to API -----------------
+def get_api_data(state, field):
+    key = f"{state}_{field}"
+    if key in API_CACHE:
+        return API_CACHE[key]
+    params = {"api-key": API_KEY, "format": "json", "limit": 1, "filters[state]": state}
+    try:
+        response = requests.get(CENSUS_API_URL, params=params)
+        data = response.json()
+        records = data.get("records", [])
+        if records:
+            value = records[0].get(field, None)
+            if isinstance(value, (np.integer, np.int64)):
+                value = int(value)
+            API_CACHE[key] = {"state": state, "attribute": field, "value": value}
+            return API_CACHE[key]
+    except Exception:
+        pass
+    return None
+
+
+# ----------------- Routes -----------------
+@app.get("/languages")
+async def get_supported_languages():
+    """Get list of all supported languages"""
+    return {
+        "languages": [
+            {
+                "code": lang_info["code"],
+                "name": lang_info["name"],
+                "native": lang_info["native"]
+            }
+            for lang_info in SUPPORTED_LANGUAGES.values()
+        ],
+        "count": len(SUPPORTED_LANGUAGES)
+    }
+
+@app.get("/history/{session_id}")
+async def get_history(session_id: str):
+    return load_history(session_id)
+
+@app.post("/chat")
+async def chat(request: ChatRequest, generate_audio: bool = False):
+    # Normalize language code
+    language_code = get_language_code(request.language)
+    
+    # Prepare Redis cache key
+    cache_key = f"chat:{language_code}:{request.message.strip().lower()}"
+    cached_payload = None
+    if redis_client is not None:
+        try:
+            cached_str = redis_client.get(cache_key)
+            if cached_str:
+                cached_payload = json.loads(cached_str)
+        except Exception:
+            cached_payload = None
+    
+    # Translate user message to English
+    try:
+        translated_msg = cached_payload.get("_translated_msg") if cached_payload else translator.translate(request.message, src=language_code, dest='en').text
+    except Exception as e:
+        # If translation fails, try to process the query directly in English
+        print(f"Translation error for language {language_code}: {e}")
+        translated_msg = request.message
+
+    # Extract state & attribute using fuzzy matching
+    filters = cached_payload.get("_filters") if cached_payload else parse_query_for_filters(translated_msg)
+    
+    # Check if we were able to extract state and field
+    if not filters["state"]:
+        bot_response_en = "Sorry, I couldn't identify the state in your query. Please specify a state name (e.g., 'Bihar', 'Maharashtra', etc.)."
+        data = {"error": bot_response_en}
+    elif not filters["field"]:
+        bot_response_en = f"Sorry, I couldn't identify what information you're asking about for {filters['state']}. Please specify what you want to know (e.g., 'population', 'literates', 'households', etc.)."
+        data = {"error": bot_response_en}
+    else:
+        # Local dataset first
+        data = cached_payload.get("data") if cached_payload else get_census_data(filters["state"], filters["field"])
+
+        # Fallback to API if local data not found
+        if (not cached_payload) and ("error" in data and filters["state"] and filters["field"]):
+            api_data = get_api_data(filters["state"], filters["field"])
+            if api_data:
+                data = api_data
+
+        # Prepare bot response
+        if "error" in data:
+            bot_response_en = data["error"]
+        else:
+            # Format the attribute name nicely
+            attribute_name = data['attribute'].replace('_', ' ').title()
+            value = data['value']
+            
+            # Format value with commas for large numbers
+            if isinstance(value, (int, np.integer, np.int64)):
+                value_formatted = f"{value:,}"
+            else:
+                value_formatted = str(value)
+            
+            # Create a clear, structured response
+            bot_response_en = f"The {attribute_name} of {data['state']} is {value_formatted}."
+
+    # Translate back to user language
+    try:
+        translated_response = cached_payload.get("response") if cached_payload else translator.translate(bot_response_en, src='en', dest=language_code).text
+    except Exception as e:
+        # If translation fails, return English response
+        print(f"Translation error for language {language_code}: {e}")
+        translated_response = bot_response_en
+
+    # Save session history
+    history = load_history(request.session_id)
+    history.append({
+        "user": request.message,
+        "bot": translated_response,
+        "timestamp": str(datetime.now())
+    })
+    save_history(request.session_id, history)
+
+    # Cache and bump frequency
+    if redis_client is not None:
+        try:
+            payload = {
+                "response": translated_response,
+                "data": data,
+                "_translated_msg": translated_msg,
+                "_filters": filters,
+            }
+            redis_client.setex(cache_key, 3600, json.dumps(payload))
+            redis_client.zincrby("query_frequency", 1, cache_key)
+        except Exception:
+            pass
+
+    # Optionally generate TTS
+    audio_url = None
+    if generate_audio:
+        try:
+            # Map language code to gTTS language code (some may differ)
+            tts_lang_map = {
+                "hi": "hi", "en": "en", "bn": "bn", "te": "te", "mr": "mr",
+                "ta": "ta", "gu": "gu", "kn": "kn", "ml": "ml", "or": "or", "ur": "ur", "sa": "sa", 
+                "ne": "ne"
+            }
+            tts_lang = tts_lang_map.get(language_code, "en")
+            tts = gTTS(text=translated_response, lang=tts_lang)
+            filename = f"response_{hash(translated_response)}_{int(datetime.now().timestamp())}.mp3"
+            filepath = os.path.join("static", filename)
+            tts.save(filepath)
+            audio_url = f"/static/{filename}"
+        except Exception as e:
+            print(f"TTS generation error for language {language_code}: {e}")
+
+    # Return structured response along with history
+    return {
+        "response": translated_response,
+        "audio_url": audio_url,
+        "history": history,
+        "data": data  # structured entity-attribute response
+    }
+
+# ----------------- User & Sessions -----------------
+@app.post("/login")
+async def login(request: LoginRequest):
+    user_id = request.user_id.strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    session_id = uuid.uuid4().hex
+    sessions = load_sessions()
+    sessions[session_id] = user_id
+    save_sessions(sessions)
+    return {"user_id": user_id, "session_id": session_id}
+
+@app.get("/user_history/{user_id}")
+async def get_user_history(user_id: str):
+    sessions = load_sessions()
+    user_session_ids = [sid for sid, uid in sessions.items() if uid == user_id]
+    all_histories = []
+    for sid in user_session_ids:
+        hist = load_history(sid)
+        if hist:
+            all_histories.append({"session_id": sid, "history": hist})
+    return {"user_id": user_id, "sessions": user_session_ids, "histories": all_histories}
+
+@app.get("/top_queries")
+async def top_queries(limit: int = 10):
+    if redis_client is None:
+        return {"queries": []}
+    try:
+        items = redis_client.zrevrange("query_frequency", 0, limit - 1, withscores=True)
+        return {"queries": [{"key": key, "count": int(score)} for key, score in items]}
+    except Exception:
+        return {"queries": []}
+@app.post("/stt")
+async def speech_to_text(request: VoiceRequest):
+    recognizer = sr.Recognizer()
+    audio_bytes = base64.b64decode(request.audio_data)
+    audio = sr.AudioData(audio_bytes, sample_rate=16000, sample_width=2)
+    
+    # Normalize language code
+    language_code = get_language_code(request.language)
+    
+    # Map language code to Google Speech Recognition language code
+    stt_lang_map = {
+        "hi": "hi-IN", "en": "en-IN", "bn": "bn-IN", "te": "te-IN", "mr": "mr-IN",
+        "ta": "ta-IN", "gu": "gu-IN", "kn": "kn-IN", "ml": "ml-IN", "or": "or-IN", "as": "as-IN", "ur": "ur-IN",
+        "ne": "ne-NP"
+    }
+    stt_lang = stt_lang_map.get(language_code, "en-IN")
+    
+    try:
+        text = recognizer.recognize_google(audio, language=stt_lang)
+        return {"text": text}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Speech recognition failed: {e}")
+
+@app.post("/tts")
+async def text_to_speech(request: TTSRequest):
+    try:
+        # Normalize language code
+        language_code = get_language_code(request.language)
+        
+        # Map language code to gTTS language code
+        tts_lang_map = {
+            "hi": "hi", "en": "en", "bn": "bn", "te": "te", "mr": "mr",
+            "ta": "ta", "gu": "gu", "kn": "kn", "ml": "ml", "or": "or",  "ur": "ur",
+            "ne": "ne"
+        }
+        tts_lang = tts_lang_map.get(language_code, "en")
+        
+        tts = gTTS(text=request.text, lang=tts_lang)
+        filename = f"response_{hash(request.text)}_{int(datetime.now().timestamp())}.mp3"
+        filepath = os.path.join("static", filename)
+        tts.save(filepath)
+        return {"audio_url": f"/static/{filename}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
